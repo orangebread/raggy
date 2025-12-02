@@ -245,105 +245,24 @@ See [TESTING.md](TESTING.md) for detailed testing documentation.
 
 ## AI Agent Integration
 
-To create knowledge-driven development with continuous context, add this prompt to your `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, or similar AI agent instruction files:
+Raggy is designed to work seamlessly with AI coding agents (Claude, Cursor, Windsurf, etc.). To enable **Knowledge-Driven Development**, you must provide your agent with the "operating protocol" defined in `AGENTS.md`.
 
-````markdown
-# MANDATORY: Knowledge-Driven Development Workflow
+### Why `AGENTS.md` is Critical
 
-You are a senior development partner. For EVERY task, you MUST follow this exact workflow:
+`AGENTS.md` is not just a set of instructions; it is the **cortex** of your AI developer. It solves the "Cold Start" problem where agents lack context about your project's history, architecture, and active state.
 
-## PHASE 1: CONTEXT GATHERING (MANDATORY)
-Before starting ANY development work, you MUST:
+By including `AGENTS.md` in your agent's system prompt or rules, you ensure:
+1.  **Context Awareness**: The agent explicitly gathers context from `CURRENT_STATE.md` and RAG search *before* writing code.
+2.  **Architectural Consistency**: It enforces adherence to established patterns found in your documentation.
+3.  **Living Memory**: It forces the agent to update `CURRENT_STATE.md` and `CHANGELOG.md`, creating a continuous loop of knowledge preservation.
 
-1. **Read Development State**:
-   - ALWAYS read `./docs/DEVELOPMENT_STATE.md` first to understand:
-     - What was accomplished in the previous task
-     - Current project status and active features
-     - Next planned steps and priorities
-     - Any blockers or decisions pending
+### How to Enable
 
-2. **Query Project Knowledge**:
-   - Run: `python raggy.py search "[current task/feature keywords]"`
-   - Run: `python raggy.py search "architecture patterns"`
-   - Run: `python raggy.py search "coding standards"`
-   - Run: `python raggy.py search "[relevant tech stack/framework]"`
-   - Search for ANY technical context related to the current task
+1.  **Copy the content** of [AGENTS.md](AGENTS.md).
+2.  **Paste it** into your agent's custom instructions file:
+    - **Cursor**: `.cursorrules`
+    - **Windsurf**: `~/.codeium/windsurf/memories` (or project-specific rules)
+    - **Claude Projects**: Project Instructions
+    - **General LLMs**: Paste it at the start of your session.
 
-3. **Synthesize Context**:
-   - Combine user request + development state + RAG knowledge
-   - Identify gaps in understanding before proceeding
-   - Ask clarifying questions if context is incomplete
-
-## PHASE 2: DEVELOPMENT APPROACH (MANDATORY)
-Think step-by-step using this pattern:
-
-1. **Problem Analysis**: 
-   - Break down the task into specific technical requirements
-   - Identify dependencies and potential conflicts
-   - Consider how this fits into the overall system architecture
-
-2. **Design Decisions**:
-   - Justify architectural choices based on existing patterns
-   - Consider alternatives and explain trade-offs
-   - Ensure consistency with established code patterns
-
-3. **Implementation Plan**:
-   - Create concrete steps with clear success criteria
-   - Identify testing approach and validation methods
-   - Plan for error handling and edge cases
-
-## PHASE 3: EXECUTION WITH VERIFICATION
-During development:
-1. **Follow Established Patterns**: Use existing code patterns and conventions from the RAG knowledge
-2. **Progressive Validation**: Test each step before moving to the next
-3. **Self-Review**: After each significant change, ask yourself:
-   - Does this align with the project architecture?
-   - Am I following the established coding standards?
-   - Have I handled error cases appropriately?
-   - Is this solution maintainable and extensible?
-
-## PHASE 4: DOCUMENTATION (MANDATORY)
-After EVERY task completion, you MUST:
-
-1. **Update Development State**:
-   Update `./docs/DEVELOPMENT_STATE.md` with:
-   - **COMPLETED**: Detailed description of what was implemented
-   - **DECISIONS**: All architectural and technical decisions made
-   - **CHANGES**: Files modified, new dependencies, configuration changes
-   - **TESTING**: What was tested and validation results
-   - **NEXT STEPS**: Immediate follow-up tasks and long-term considerations
-   - **BLOCKERS**: Any issues discovered or decisions needed
-
-2. **Log to RAG Database**:
-   Create `./docs/dev_log_[timestamp].md` with:
-   - Technical decisions and rationale
-   - Code patterns used and why
-   - Integration points and dependencies
-   - Performance considerations
-   - Security implications
-   - Future refactoring opportunities
-
-3. **Rebuild RAG**:
-   Run: `python raggy.py build`  # Ensure new knowledge is indexed
-
-## CRITICAL SUCCESS BEHAVIORS:
-
-✅ **ALWAYS** start with `./docs/DEVELOPMENT_STATE.md` - NO EXCEPTIONS  
-✅ **ALWAYS** query RAG for relevant context before coding  
-✅ **NEVER** make architectural decisions without understanding existing patterns  
-✅ **ALWAYS** document decisions immediately, not later  
-✅ **ALWAYS** think step-by-step and show your reasoning  
-✅ **ALWAYS** validate your work against existing standards  
-✅ **ALWAYS** update both `./docs/DEVELOPMENT_STATE.md` and create dev logs  
-
-## FAILURE CONDITIONS:
-❌ Starting development without reading `./docs/DEVELOPMENT_STATE.md`  
-❌ Making changes without querying relevant RAG context  
-❌ Completing tasks without proper documentation updates  
-❌ Ignoring established patterns or architectural decisions  
-❌ Skipping the knowledge update cycle
-
-This workflow ensures continuous knowledge building and prevents context loss between development sessions. Each task builds upon documented knowledge, creating a self-improving development process.
-````
-
-This prompt creates a robust, knowledge-driven development cycle where AI agents maintain continuity and build institutional knowledge over time.
+> **⚠️ IMPORTANT**: Without this protocol, your agent is just a smart code generator. WITH this protocol, it becomes a **strategic partner** that maintains your project's long-term health.
