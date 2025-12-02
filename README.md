@@ -6,7 +6,7 @@
 
 ## Quick Start
 
-Download `raggy.py` and place it in the root of your project. All you need to do next is put all your documents for the RAG inside a `./docs` folder and **build** the RAG using the command line.
+Download `raggy.py` (or the `raggy` launcher) and place it in the root of your project. All you need to do next is put all your documents for the RAG inside a `./docs` folder and **build** the RAG using the command line.
 
 **Supported file formats:** `.md` (Markdown), `.pdf` (PDF), `.docx` (Word), `.txt` (Plain text)
 
@@ -19,15 +19,22 @@ python raggy.py init                     # Initialize environment and install de
 python raggy.py build                    # Index your docs
 python raggy.py search "your query"      # Search with normalized scores
 
+# Or use the portable launcher (auto-manages venv & deps):
+./raggy build
+./raggy search "your query"
+
 # Enhanced features  
 python raggy.py search "term" --hybrid   # Hybrid semantic + keyword search
 python raggy.py search "api" --expand    # Query expansion
+python raggy.py search "fix" --path docs/CHANGELOG.md  # Filter by path
 python raggy.py optimize                 # Benchmark search modes
 
 # Quality assurance (new!)
 python raggy.py test                     # Run built-in self-tests
 python raggy.py diagnose                 # Check system health  
 python raggy.py validate                 # Verify configuration
+python raggy.py compact                  # Archive aged docs and refresh index
+python raggy.py compact --yes            # Compact without confirmation (for scripts)
 
 # Version management
 python raggy.py --version                # Show current version
@@ -93,14 +100,14 @@ updates:
 
 ### Quality & Reliability (New!)
 - **Built-in Testing**: Self-diagnostics with `python raggy.py test`
-- **System Health**: Comprehensive diagnostics with `python raggy.py diagnose`  
+- **System Health**: Comprehensive diagnostics with `python raggy.py diagnose` and detailed status with `python raggy.py status`  
 - **Security Hardened**: Path validation, input sanitization, secure hashing
 - **Type Safe**: Full type hints for better IDE support and error prevention
 - **Performance Optimized**: Streaming file processing and pre-compiled regex patterns
 - **Comprehensive Testing**: 85%+ test coverage with unit and integration tests
 
 ### Developer Experience
-- **Universal**: Drop into any project - just copy `raggy.py` 
+- **Universal**: Drop into any project - just copy `raggy.py` (or `raggy`) 
 - **💰 Completely Free**: No API costs - everything runs locally
 - **🏠 100% Private**: Your documents never leave your machine
 - **⚡ Fast Setup**: One command initialization with automatic dependency management
@@ -162,11 +169,15 @@ updates:
 4. **Index your documents**:
    ```bash
    python raggy.py build
+   # Or:
+   ./raggy build
    ```
 
 5. **Start searching**:
    ```bash
    python raggy.py search "your query"
+   # Or:
+   ./raggy search "your query"
    ```
 
 ## Testing & Quality Assurance
@@ -216,6 +227,7 @@ See [TESTING.md](TESTING.md) for detailed testing documentation.
 - **Streaming file processing** for large documents
 - **Optimized memory usage** with chunked file operations
 - **Enhanced BM25 scoring** with improved tokenization
+- **Portable Launcher**: New `./raggy` script for zero-config execution (auto-manages venv & dependencies)
 
 ### 🧪 Enterprise-Grade Testing
 - **85%+ test coverage** with comprehensive test suite

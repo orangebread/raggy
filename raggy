@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+# Portable Raggy launcher with bootstrap and environment checks
+# - Creates/uses .venv
+# - Prefers uv for speed; falls back to python -m venv + pip
+# - Ensures core deps are installed
+# - Forwards all args to raggy.py, adding --skip-deps when uv is unavailable
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# Move to project root (script location)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+log() { printf "[raggy] %s\n" "$*"; }
+err() { printf "[raggy] ERROR: %s\n" "$*" >&2; }
+
+# 1) Resolve Python interpreter (3.8+)
+# Default Python version for venv when using uv (override with RAGGY_PYTHON_VERSION)
+RAGGY_PYTHON_VERSION="${RAGGY_PYTHON_VERSION:-3.11}"
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+  else
+    err "python3 not found. Please install Python 3.8+"
+    exit 1
+  fi
+fi
+
+if ! "${PYTHON_BIN}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,8) else 1)'; then
+  err "Python >= 3.8 required"
+  exit 1
+fi
+
+# 2) Paths
+VENV_DIR="$SCRIPT_DIR/.venv"
+VENV_BIN="$VENV_DIR/bin"
+VENV_PY="$VENV_BIN/python"
+VENV_PIP="$VENV_BIN/pip"
+
+# 3) Detect uv
+HAS_UV=0
+if command -v uv >/dev/null 2>&1; then
+  HAS_UV=1
+fi
+
+# 4) Ensure virtual environment exists
+if [[ ! -x "$VENV_PY" ]]; then
+  if [[ "$HAS_UV" -eq 1 ]]; then
+    log "Creating virtual environment with uv (Python ${RAGGY_PYTHON_VERSION})..."
+    if ! uv venv --python "${RAGGY_PYTHON_VERSION}"; then
+      log "uv venv failed; falling back to python -m venv"
+      "${PYTHON_BIN}" -m venv "$VENV_DIR"
+    fi
+  else
+    log "Creating virtual environment with python -m venv..."
+    "${PYTHON_BIN}" -m venv "$VENV_DIR"
+  fi
+  # Ensure pip inside venv
+  if [[ ! -x "$VENV_PIP" ]]; then
+    log "Bootstrapping pip in venv..."
+    "$VENV_PY" -m ensurepip --upgrade || true
+  fi
+fi
+
+# 5) Ensure pyproject.toml exists (raggy.py expects it for init flows)
+if [[ ! -f "$SCRIPT_DIR/pyproject.toml" ]]; then
+  log "Creating minimal pyproject.toml..."
+  cat > "$SCRIPT_DIR/pyproject.toml" <<'EOF'
+[project]
+name = "raggy-project"
+version = "0.1.0"
+description = "RAG project using Universal ChromaDB RAG System"
+requires-python = ">=3.8"
+dependencies = [
+  "chromadb>=0.4.0",
+  "sentence-transformers>=2.2.0",
+  "PyPDF2>=3.0.0",
+  "python-docx>=1.0.0",
+]
+
+[project.optional-dependencies]
+magic-win = ["python-magic-bin>=0.4.14"]
+magic-unix = ["python-magic"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+EOF
+fi
+
+# 6) Ensure core dependencies (with verification and retries)
+ensure_deps_with_uv() {
+  log "Ensuring dependencies with uv pip..."
+  # Base deps
+  if ! uv pip install \
+      "chromadb>=0.4.0" \
+      "sentence-transformers>=2.2.0" \
+      "PyPDF2>=3.0.0" \
+      "python-docx>=1.0.0" \
+      torch; then
+    log "uv pip install failed; falling back to pip"
+    ensure_deps_with_pip
+    return
+  fi
+  # Optional magic
+  case "${OSTYPE:-}" in
+    msys*|cygwin*|win32*) uv pip install "python-magic-bin>=0.4.14" || log "python-magic-bin install failed (optional)" ;;
+    *) uv pip install "python-magic" || log "python-magic install failed (optional)" ;;
+  esac
+}
+
+ensure_deps_with_pip() {
+  log "Ensuring dependencies with pip (no uv detected)..."
+  "$VENV_PIP" install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+  "$VENV_PIP" install \
+    "chromadb>=0.4.0" \
+    "sentence-transformers>=2.2.0" \
+    "PyPDF2>=3.0.0" \
+    "python-docx>=1.0.0" \
+    torch || true
+  case "${OSTYPE:-}" in
+    msys*|cygwin*|win32*) "$VENV_PIP" install "python-magic-bin>=0.4.14" || true ;;
+    *) "$VENV_PIP" install "python-magic" || true || log "python-magic unavailable; file type detection may be limited" ;;
+  esac
+}
+
+pip_spec_for_import() {
+  case "$1" in
+    chromadb) echo "chromadb>=0.4.0" ;;
+    sentence_transformers) echo "sentence-transformers>=2.2.0" ;;
+    PyPDF2) echo "PyPDF2>=3.0.0" ;;
+    docx) echo "python-docx>=1.0.0" ;;
+    torch) echo "torch" ;;
+    magic)
+      case "${OSTYPE:-}" in
+        msys*|cygwin*|win32*) echo "python-magic-bin>=0.4.14" ;;
+        *) echo "python-magic" ;;
+      esac
+      ;;
+    *) echo "$1" ;;
+  esac
+}
+
+python_can_import() {
+  local mod="$1"
+  "$VENV_PY" -c "import ${mod}" >/dev/null 2>&1
+}
+
+verify_and_fix_imports() {
+  local modules=(chromadb sentence_transformers PyPDF2 docx torch)
+  local missing_modules=()
+  for m in "${modules[@]}"; do
+    if ! python_can_import "$m"; then
+      missing_modules+=("$m")
+    fi
+  done
+
+  if [[ ${#missing_modules[@]} -gt 0 ]]; then
+    for mod in "${missing_modules[@]}"; do
+      local spec
+      spec="$(pip_spec_for_import "$mod")"
+      if [[ "$HAS_UV" -eq 1 ]]; then
+        uv pip install "$spec" || true
+      else
+        "$VENV_PIP" install "$spec" || true
+      fi
+      # Special-case: ensure torch before retrying sentence-transformers
+      if [[ "$mod" == "sentence_transformers" ]]; then
+        if ! python_can_import torch; then
+          if [[ "$HAS_UV" -eq 1 ]]; then uv pip install torch || true; else "$VENV_PIP" install torch || true; fi
+        fi
+        if [[ "$HAS_UV" -eq 1 ]]; then uv pip install "sentence-transformers>=2.2.0" || true; else "$VENV_PIP" install "sentence-transformers>=2.2.0" || true; fi
+      fi
+    done
+  fi
+
+  # Final verification (fail loud if still missing)
+  missing_modules=()
+  for m in "${modules[@]}"; do
+    if ! python_can_import "$m"; then
+      missing_modules+=("$m")
+    fi
+  done
+  if [[ ${#missing_modules[@]} -gt 0 ]]; then
+    err "Missing required Python modules after installation: ${missing_modules[*]}"
+    err "Please check network connectivity or package availability and re-run."
+    exit 1
+  fi
+}
+
+if [[ "$HAS_UV" -eq 1 ]]; then
+  ensure_deps_with_uv
+else
+  ensure_deps_with_pip
+fi
+# Verify and self-heal missing imports
+verify_and_fix_imports
+
+# 7) Create docs/ and example config if missing (developer UX)
+if [[ ! -d "$SCRIPT_DIR/docs" ]]; then
+  mkdir -p "$SCRIPT_DIR/docs"
+  log "Created docs/ directory"
+fi
+
+# Only create example config if neither the example nor the real config exists
+if [[ ! -f "$SCRIPT_DIR/raggy_config_example.yaml" && ! -f "$SCRIPT_DIR/raggy_config.yaml" ]]; then
+  log "Creating raggy_config_example.yaml..."
+  cat > "$SCRIPT_DIR/raggy_config_example.yaml" <<'EOF'
+# raggy_config_example.yaml - Example Configuration File
+# Copy this to raggy_config.yaml and customize for your domain
+
+search:
+  hybrid_weight: 0.7
+  chunk_size: 1000
+  chunk_overlap: 200
+  rerank: true
+  show_scores: true
+  context_chars: 200
+  max_results: 5
+  expansions:
+    api: ["api", "application programming interface", "rest api", "web service"]
+    ml: ["ml", "machine learning", "artificial intelligence"]
+    ai: ["ai", "artificial intelligence", "machine learning"]
+    ui: ["ui", "user interface", "frontend", "user experience"]
+    ux: ["ux", "user experience", "usability", "user interface"]
+
+models:
+  default: "all-MiniLM-L6-v2"
+  fast: "paraphrase-MiniLM-L3-v2"
+  multilingual: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+  accurate: "all-mpnet-base-v2"
+
+chunking:
+  smart: true
+  preserve_headers: true
+  min_chunk_size: 300
+  max_chunk_size: 1500
+
+maintenance:
+  thresholds:
+    soft_chunk_limit: 8000
+    hard_chunk_limit: 12000
+    soft_document_limit: 300
+    per_document_chunk_limit: 800
+  retention:
+    hot_days: 21
+    min_hot_updates: 5
+  paths:
+    archive_dir: "archive/development_state"
+    digest_dir: "summaries"
+  auto_compact:
+    rebuild_after_compact: true
+EOF
+fi
+
+# Function: create CURRENT_STATE.md and CHANGELOG.md if missing
+ensure_state_files() {
+  local current_state="$SCRIPT_DIR/docs/CURRENT_STATE.md"
+  local changelog="$SCRIPT_DIR/docs/CHANGELOG.md"
+  local ts
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+
+  if [[ ! -f "$current_state" ]]; then
+    log "Creating initial CURRENT_STATE.md..."
+    cat > "$current_state" <<EOF
+# Current State
+
+**Last Updated:** $ts
+**RAG System:** Raggy v2.0.0
+
+## Architecture
+- **Type:** Universal ChromaDB RAG
+- **Storage:** Local Vector DB (./vectordb)
+
+## Active Features
+- **Smart Chunking:** Enabled (Markdown-aware)
+- **Search:** Semantic + Keyword (Hybrid)
+- **Context:** Tiered (Current State + Changelog)
+
+## Current Focus
+- Initial setup and configuration
+
+## Next Steps
+1. Add documentation to docs/
+2. Run \`./raggy build\`
+3. Start development
+EOF
+  fi
+
+  if [[ ! -f "$changelog" ]]; then
+    log "Creating initial CHANGELOG.md..."
+    cat > "$changelog" <<EOF
+# Project Changelog
+
+## Update - $ts (Initialization)
+
+COMPLETED:
+- ✅ Raggy environment initialized
+- ✅ Documentation structure created (CURRENT_STATE.md, CHANGELOG.md)
+- ✅ Dependencies installed
+
+DECISIONS:
+- Adopted Tiered Context workflow
+EOF
+  fi
+}
+
+# 8) Intercept `init` to guarantee bootstrap regardless of uv state
+PASSTHRU_ARGS=("$@")
+if [[ ${1:-} == "init" ]]; then
+  # For init, (re)create venv with a compatible Python version if uv is available
+  if [[ "$HAS_UV" -eq 1 ]]; then
+    if [[ -d "$VENV_DIR" ]]; then
+      log "Recreating virtual environment with uv (Python ${RAGGY_PYTHON_VERSION}) for compatibility..."
+      rm -rf "$VENV_DIR"
+    fi
+    if ! uv venv --python "${RAGGY_PYTHON_VERSION}"; then
+      err "Failed to create uv venv with Python ${RAGGY_PYTHON_VERSION}."
+      exit 1
+    fi
+    # refresh paths
+    VENV_BIN="$VENV_DIR/bin"
+    VENV_PY="$VENV_BIN/python"
+    VENV_PIP="$VENV_BIN/pip"
+  else
+    # No uv: if system Python is >=3.13, torch wheels may be unavailable → instruct to install uv
+    if "${PYTHON_BIN}" -c 'import sys; import sys; sys.exit(0 if sys.version_info >= (3,13) else 1)'; then
+      err "Python 3.13 detected and uv is not installed; PyTorch wheels may be unavailable for your platform."
+      err "Install uv and re-run: curl -LsSf https://astral.sh/uv/install.sh | sh"
+      exit 1
+    fi
+  fi
+
+  # Ensure pyproject/docs/config
+  ensure_state_files
+
+  # Install dependencies into the freshly created venv and verify
+  if [[ "$HAS_UV" -eq 1 ]]; then
+    ensure_deps_with_uv
+  else
+    ensure_deps_with_pip
+  fi
+  verify_and_fix_imports
+
+  log "Initialization complete. Verifying setup..."
+  # Always skip dependency checks here; wrapper ensured deps
+  exec "$VENV_PY" "$SCRIPT_DIR/raggy.py" --skip-deps status
+fi
+
+# 9) Execute raggy.py from venv (regular commands)
+# We always pass --skip-deps because the wrapper guaranteed dependencies
+exec "$VENV_PY" "$SCRIPT_DIR/raggy.py" --skip-deps "${PASSTHRU_ARGS[@]}"

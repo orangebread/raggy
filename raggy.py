@@ -37,6 +37,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import (
@@ -66,6 +67,16 @@ DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_RESULTS = 5
 DEFAULT_CONTEXT_CHARS = 200
 DEFAULT_HYBRID_WEIGHT = 0.7
+MANIFEST_FILENAME = "index-manifest.json"
+MANIFEST_SCHEMA_VERSION = 1
+DEFAULT_SOFT_CHUNK_LIMIT = 8000
+DEFAULT_HARD_CHUNK_LIMIT = 12000
+DEFAULT_SOFT_DOCUMENT_LIMIT = 300
+DEFAULT_PER_DOC_CHUNK_LIMIT = 800
+DEFAULT_HOT_RETENTION_DAYS = 21
+DEFAULT_MIN_HOT_UPDATES = 5
+DEFAULT_ARCHIVE_SUBDIR = "archive/development_state"
+DEFAULT_DIGEST_SUBDIR = "summaries"
 
 # File type constants
 SUPPORTED_EXTENSIONS = [".md", ".pdf", ".docx", ".txt"]
@@ -192,6 +203,49 @@ def handle_file_error(file_path: Path, operation: str, error: Exception, *, quie
         log_error(f"Cannot {operation} {file_path.name} - encoding issue", quiet=quiet)
     else:
         log_error(f"Cannot {operation} {file_path.name}", error, quiet=quiet)
+
+
+def _default_manifest() -> Dict[str, Any]:
+    """Return an empty manifest structure."""
+    return {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "model_name": None,
+        "embedding_dim": None,
+        "documents": {},
+        "last_built_at": None,
+    }
+
+
+def load_manifest(manifest_path: Path, *, quiet: bool = False) -> Dict[str, Any]:
+    """Load the index manifest if it exists, otherwise return defaults."""
+    if not manifest_path.exists():
+        return _default_manifest()
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+            data = json.load(manifest_file)
+    except (json.JSONDecodeError, OSError) as err:
+        log_warning(
+            f"Could not read manifest at {manifest_path.name}; starting fresh",
+            err,
+            quiet=quiet,
+        )
+        return _default_manifest()
+
+    data.setdefault("schema_version", MANIFEST_SCHEMA_VERSION)
+    data.setdefault("model_name", None)
+    data.setdefault("embedding_dim", None)
+    data.setdefault("documents", {})
+    data.setdefault("last_built_at", None)
+    return data
+
+
+def save_manifest(manifest_path: Path, manifest: Dict[str, Any]) -> None:
+    """Persist the index manifest to disk."""
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest["schema_version"] = MANIFEST_SCHEMA_VERSION
+    with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+        json.dump(manifest, manifest_file, indent=2, sort_keys=True)
 
 
 def check_for_updates(
@@ -494,10 +548,29 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             "accurate": ACCURATE_MODEL,
         },
         "chunking": {
-            "smart": False,  # Disable by default to prevent issues
+            "smart": True,  # Enable by default for better documentation structure
             "preserve_headers": True,
             "min_chunk_size": 300,
             "max_chunk_size": 1500,
+        },
+        "maintenance": {
+            "thresholds": {
+                "soft_chunk_limit": DEFAULT_SOFT_CHUNK_LIMIT,
+                "hard_chunk_limit": DEFAULT_HARD_CHUNK_LIMIT,
+                "soft_document_limit": DEFAULT_SOFT_DOCUMENT_LIMIT,
+                "per_document_chunk_limit": DEFAULT_PER_DOC_CHUNK_LIMIT,
+            },
+            "retention": {
+                "hot_days": DEFAULT_HOT_RETENTION_DAYS,
+                "min_hot_updates": DEFAULT_MIN_HOT_UPDATES,
+            },
+            "paths": {
+                "archive_dir": DEFAULT_ARCHIVE_SUBDIR,
+                "digest_dir": DEFAULT_DIGEST_SUBDIR,
+            },
+            "auto_compact": {
+                "rebuild_after_compact": True,
+            },
         },
         "updates": {
             "check_enabled": True,  # Enable update checking by default
@@ -843,8 +916,16 @@ def setup_environment(quiet: bool = False) -> bool:
 
 
 def _create_example_config(quiet: bool = False) -> bool:
-    """Create example configuration file."""
+    """Create example configuration file, but only if no real config exists."""
     config_example_path = Path("raggy_config_example.yaml")
+    real_config_path = Path("raggy_config.yaml")
+
+    # If a real config exists, do not create the example file
+    if real_config_path.exists():
+        if not quiet:
+            print("raggy_config.yaml exists; skipping example config generation")
+        return True
+
     if not config_example_path.exists():
         if not quiet:
             print("Creating raggy_config_example.yaml...")
@@ -892,10 +973,25 @@ models:
   accurate: "all-mpnet-base-v2"         # Best accuracy, slower
 
 chunking:
-  smart: false          # Enable markdown-aware smart chunking (experimental)
+  smart: true           # Enable markdown-aware smart chunking
   preserve_headers: true # Include section headers in chunks
   min_chunk_size: 300   # Minimum chunk size in characters
   max_chunk_size: 1500  # Maximum chunk size in characters
+
+maintenance:
+  thresholds:
+    soft_chunk_limit: 8000      # Warn when active chunks exceed this value
+    hard_chunk_limit: 12000     # Require compaction once this limit is reached
+    soft_document_limit: 300    # Warn when document count exceeds this value
+    per_document_chunk_limit: 800 # Flag any single doc that exceeds this many chunks
+  retention:
+    hot_days: 21                # Keep updates newer than this many days in the hot ledger
+    min_hot_updates: 5          # Always retain at least this many recent updates
+  paths:
+    archive_dir: "archive/development_state" # Relative to docs/ directory
+    digest_dir: "summaries"                  # Monthly digest output directory
+  auto_compact:
+    rebuild_after_compact: true  # Automatically rebuild index after compaction
 
 # Usage:
 # 1. Copy this file to raggy_config.yaml  
@@ -1100,7 +1196,17 @@ class DocumentProcessor:
         
         return sorted(files)
     
-    def process_document(self, file_path: Path) -> List[Dict[str, Any]]:
+    def get_file_hash(self, file_path: Path) -> Optional[str]:
+        """Public helper to compute file hash for change detection."""
+        try:
+            return self._get_file_hash(file_path)
+        except Exception as error:  # pragma: no cover - defensive guard
+            handle_file_error(file_path, "hash", error, quiet=self.quiet)
+            return None
+
+    def process_document(
+        self, file_path: Path, file_hash: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """Process a single document into chunks."""
         if not self.quiet:
             print(f"Processing: {file_path.relative_to(self.docs_dir)}")
@@ -1140,10 +1246,12 @@ class DocumentProcessor:
 
             # Generate chunks
             chunk_data = self._chunk_text(text)
+            chunk_data = self._consolidate_small_chunks(chunk_data)
 
             # Create document entries
             documents = []
-            file_hash = self._get_file_hash(file_path)
+            if file_hash is None:
+                file_hash = self._get_file_hash(file_path)
 
             for i, chunk_info in enumerate(chunk_data):
                 doc_id = f"{file_path.stem}_{file_hash[:8]}_{i}"
@@ -1155,6 +1263,7 @@ class DocumentProcessor:
                     "total_chunks": len(chunk_data),
                     "file_hash": file_hash,
                     "file_type": file_path.suffix.lower(),
+                    "is_current_state": file_path.name == "CURRENT_STATE.md",
                 }
                 metadata.update(chunk_info.get("metadata", {}))
 
@@ -1317,14 +1426,21 @@ class DocumentProcessor:
 
         # Split by major sections first (headers)
         sections = re.split(r"(^#{1,6}\s+.*$)", text, flags=re.MULTILINE)
+        
+        if not self.quiet:
+            print(f"  Smart chunking: Found {len(sections)} sections")
 
         current_header = None
         current_content = ""
+        section_count = 0
 
         for section in sections:
             if re.match(r"^#{1,6}\s+", section):
                 # Process previous section if exists
                 if current_content.strip():
+                    section_count += 1
+                    if not self.quiet:
+                        print(f"    Processing section {section_count}: {current_header[:50] if current_header else 'No header'}...")
                     section_chunks = self._process_section(
                         current_content, current_header, base_chunk_size, overlap
                     )
@@ -1338,6 +1454,9 @@ class DocumentProcessor:
 
         # Process final section
         if current_content.strip():
+            section_count += 1
+            if not self.quiet:
+                print(f"    Processing final section {section_count}: {current_header[:50] if current_header else 'No header'}...")
             section_chunks = self._process_section(
                 current_content, current_header, base_chunk_size, overlap
             )
@@ -1345,9 +1464,59 @@ class DocumentProcessor:
 
         # If no headers found, fall back to simple chunking
         if not chunks:
+            if not self.quiet:
+                print("  No headers found, using simple chunking")
             return self._chunk_text_simple(text, base_chunk_size, overlap)
 
+        if not self.quiet:
+            print(f"  Generated {len(chunks)} chunks")
         return chunks
+
+    def _consolidate_small_chunks(
+        self, chunks: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Merge tiny chunks to keep concise documents manageable."""
+        if not chunks:
+            return chunks
+
+        min_chunk_size = self.config["chunking"].get("min_chunk_size", DEFAULT_CHUNK_SIZE)
+        total_chars = sum(len(chunk.get("text", "")) for chunk in chunks)
+
+        # Only consolidate if a short document produced many fragments
+        if len(chunks) <= 10 or total_chars == 0:
+            return chunks
+        if total_chars >= max(min_chunk_size * 3, 1200):
+            return chunks
+
+        min_target = max(min_chunk_size // 2, 150)
+        merged: List[Dict[str, Any]] = []
+        buffer_text = ""
+        buffer_meta: Dict[str, Any] = {}
+
+        for chunk in chunks:
+            text = chunk.get("text", "").strip()
+            if not text:
+                continue
+
+            if not buffer_text:
+                buffer_text = text
+                buffer_meta = dict(chunk.get("metadata", {}))
+                continue
+
+            if len(buffer_text) < min_target or len(text) < min_target:
+                separator = "\n\n" if buffer_text else ""
+                buffer_text = f"{buffer_text}{separator}{text}" if buffer_text else text
+                buffer_meta = dict(buffer_meta or chunk.get("metadata", {}))
+                buffer_meta["coalesced"] = True
+            else:
+                merged.append({"text": buffer_text, "metadata": dict(buffer_meta)})
+                buffer_text = text
+                buffer_meta = dict(chunk.get("metadata", {}))
+
+        if buffer_text:
+            merged.append({"text": buffer_text, "metadata": dict(buffer_meta)})
+
+        return merged if merged else chunks
 
     def _process_section(
         self, content: str, header: Optional[str], chunk_size: int, overlap: int
@@ -1375,55 +1544,77 @@ class DocumentProcessor:
         if header and self.config["chunking"]["preserve_headers"]:
             content = f"{header}\n\n{content}"
 
+        # Ensure overlap never eliminates forward progress
+        effective_overlap = min(overlap, max(target_size - 1, 0))
+
         # Split content into chunks
         if len(content) <= target_size:
+            metadata = {"chunk_type": "smart"}
+            if header:
+                metadata["section_header"] = header
+                metadata["header_depth"] = len(re.findall(r"^#", header))
+            
             chunks.append(
                 {
                     "text": content,
-                    "metadata": {
-                        "chunk_type": "smart",
-                        "section_header": header,
-                        "header_depth": len(re.findall(r"^#", header or "")),
-                    },
+                    "metadata": metadata,
                 }
             )
         else:
             start = 0
+            last_start = -1
             chunk_index = 0
 
             while start < len(content):
                 end = start + target_size
 
-                # Try to break at paragraph or sentence boundary
+                # Try to break at paragraph or sentence boundary within a bounded window
                 if end < len(content):
                     # Look for paragraph breaks first
+                    found_boundary = False
                     for i in range(end, max(start + target_size - 300, start), -1):
-                        if i > start and content[i - 2 : i] == "\n\n":
+                        if i - 2 >= start and content[i - 2 : i] == "\n\n":
                             end = i
+                            found_boundary = True
                             break
-                    else:
+                    if not found_boundary:
                         # Fall back to sentence breaks
                         for i in range(end, max(start + target_size - 200, start), -1):
-                            if content[i] in ".!?\n":
+                            if i < len(content) and content[i] in ".!?\n":
                                 end = i + 1
                                 break
 
+                # Prevent degenerate range and guarantee progress
+                if end <= start:
+                    if not self.quiet:
+                        print(f"      Warning: Adjusting degenerate chunk window at position {start}; enforcing minimal progress")
+                    end = min(start + max(1, target_size // 2), len(content))
+
                 chunk_text = content[start:end].strip()
+
                 if chunk_text:
+                    metadata = {
+                        "chunk_type": "smart",
+                        "section_chunk_index": chunk_index,
+                    }
+                    if header:
+                        metadata["section_header"] = header
+                        metadata["header_depth"] = len(re.findall(r"^#", header))
+                    
                     chunks.append(
                         {
                             "text": chunk_text,
-                            "metadata": {
-                                "chunk_type": "smart",
-                                "section_header": header,
-                                "header_depth": len(re.findall(r"^#", header or "")),
-                                "section_chunk_index": chunk_index,
-                            },
+                            "metadata": metadata,
                         }
                     )
                     chunk_index += 1
 
-                start = end - overlap
+                # Compute next start ensuring strict forward progress
+                next_start = end - effective_overlap
+                if next_start <= start:
+                    next_start = start + 1
+                last_start = start
+                start = next_start
 
         return chunks
 
@@ -1476,19 +1667,56 @@ class DatabaseManager:
                 metadata={"description": "Project documentation embeddings"},
             )
             
+            # Clean metadata - remove None values which ChromaDB can't handle
+            cleaned_metadatas = []
+            for doc in documents:
+                cleaned_meta = {k: v for k, v in doc["metadata"].items() if v is not None}
+                cleaned_metadatas.append(cleaned_meta)
+            
             # Add to ChromaDB
             texts = [doc["text"] for doc in documents]
             collection.add(
                 embeddings=embeddings.tolist(),
                 documents=texts,
-                metadatas=[doc["metadata"] for doc in documents],
+                metadatas=cleaned_metadatas,
                 ids=[doc["id"] for doc in documents],
             )
             
         except Exception as e:
             log_error("Failed to build index", e, quiet=self.quiet)
             raise
-    
+
+    def delete_by_ids(self, ids: List[str]) -> None:
+        """Delete documents from the collection by id."""
+        if not ids:
+            return
+
+        try:
+            collection = self.get_collection()
+            # Chroma can only delete up to a limited batch size reliably; chunk if needed.
+            batch_size = 500
+            for start in range(0, len(ids), batch_size):
+                collection.delete(ids=ids[start : start + batch_size])
+        except Exception as error:
+            log_warning("Failed to delete documents by id", error, quiet=self.quiet)
+
+    def delete_by_sources(self, sources: List[str]) -> None:
+        """Delete all chunks that originated from specific sources."""
+        if not sources:
+            return
+
+        try:
+            collection = self.get_collection()
+        except Exception as error:
+            log_warning("Could not access collection for deletion", error, quiet=self.quiet)
+            return
+
+        for source in sources:
+            try:
+                collection.delete(where={"source": source})
+            except Exception as error:  # pragma: no cover - defensive guard
+                log_warning(f"Failed to delete source {source}", error, quiet=self.quiet)
+
     def get_collection(self):
         """Get the collection for search operations."""
         return self.client.get_collection(self.collection_name)
@@ -1525,11 +1753,13 @@ class SearchEngine:
         database_manager: DatabaseManager,
         query_processor: QueryProcessor,
         config: Dict[str, Any],
+        manifest_path: Optional[Path] = None,
         quiet: bool = False
     ) -> None:
         self.database_manager = database_manager
         self.query_processor = query_processor
         self.config = config
+        self.manifest_path = manifest_path
         self.quiet = quiet
         self._bm25_scorer = None
         self._documents_cache = None
@@ -1542,6 +1772,7 @@ class SearchEngine:
         hybrid: bool = False,
         expand_query: bool = False,
         show_scores: bool = None,
+        path_filter: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Search the vector database with enhanced capabilities."""
         try:
@@ -1563,13 +1794,55 @@ class SearchEngine:
                 }
                 processed_query = query
 
-            # Get semantic results
-            results = collection.query(
-                query_texts=[processed_query],
-                n_results=(
-                    n_results * 2 if hybrid else n_results
-                ),  # Get more for hybrid filtering
+            include_params = ["documents", "metadatas", "distances"]
+
+            manifest = (
+                load_manifest(self.manifest_path, quiet=self.quiet)
+                if self.manifest_path
+                else _default_manifest()
             )
+            expected_dim = manifest.get("embedding_dim")
+            query_embeddings = None
+            use_embeddings = True
+
+            try:
+                query_vector = embedding_model.encode([processed_query])
+                if hasattr(query_vector, "tolist"):
+                    query_embeddings = query_vector.tolist()
+                else:  # pragma: no cover - defensive fallback
+                    query_embeddings = [list(query_vector)]
+            except Exception as error:
+                log_warning("Failed to encode query embedding; falling back to text search", error, quiet=self.quiet)
+                use_embeddings = False
+
+            if (
+                use_embeddings
+                and expected_dim
+                and query_embeddings
+                and len(query_embeddings[0]) != expected_dim
+            ):
+                log_warning(
+                    "Embedding dimension mismatch detected (query vs index); falling back to text search",
+                    quiet=self.quiet,
+                )
+                use_embeddings = False
+
+            # Fetch more results if filtering to ensure we have enough after filtration
+            # If path_filter is set, we need a much larger window to find the specific file
+            fetch_k = n_results * 50 if path_filter else (n_results * 2 if hybrid else n_results)
+
+            if use_embeddings and query_embeddings:
+                results = collection.query(
+                    query_embeddings=query_embeddings,
+                    n_results=fetch_k,
+                    include=include_params,
+                )
+            else:
+                results = collection.query(
+                    query_texts=[processed_query],
+                    n_results=fetch_k,
+                    include=include_params,
+                )
 
             formatted_results = []
 
@@ -1578,6 +1851,12 @@ class SearchEngine:
                 self._init_bm25_scorer(collection)
 
             for i in range(len(results["documents"][0])):
+                # Apply path filtering if requested
+                source = results["metadatas"][0][i].get("source", "")
+                if path_filter:
+                    if not source.startswith(path_filter):
+                        continue
+
                 distance = (
                     results["distances"][0][i] if "distances" in results else None
                 )
@@ -1608,6 +1887,10 @@ class SearchEngine:
                     and query.lower() in results["documents"][0][i].lower()
                 ):
                     final_score = min(1.0, final_score * 1.5)
+
+                # Boost CURRENT_STATE.md content
+                if results["metadatas"][0][i].get("is_current_state"):
+                    final_score = min(1.0, final_score * 2.0)
 
                 formatted_results.append(
                     {
@@ -1738,8 +2021,8 @@ class UniversalRAG:
         quiet: bool = False,
         config_path: Optional[str] = None,
     ) -> None:
-        self.docs_dir = Path(docs_dir)
-        self.db_dir = Path(db_dir)
+        self.docs_dir = Path(docs_dir).resolve()
+        self.db_dir = Path(db_dir).resolve()
         self.model_name = model_name
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
@@ -1762,11 +2045,54 @@ class UniversalRAG:
             self.database_manager,
             self.query_processor,
             self.config,
+            manifest_path=self.db_dir / MANIFEST_FILENAME,
             quiet=self.quiet
         )
 
         # Lazy-loaded attributes
         self._embedding_model = None
+        maintenance_config = self.config.get("maintenance", {})
+        thresholds_config = maintenance_config.get("thresholds", {})
+        self.thresholds = {
+            "soft_chunk_limit": thresholds_config.get(
+                "soft_chunk_limit", DEFAULT_SOFT_CHUNK_LIMIT
+            ),
+            "hard_chunk_limit": thresholds_config.get(
+                "hard_chunk_limit", DEFAULT_HARD_CHUNK_LIMIT
+            ),
+            "soft_document_limit": thresholds_config.get(
+                "soft_document_limit", DEFAULT_SOFT_DOCUMENT_LIMIT
+            ),
+            "per_document_chunk_limit": thresholds_config.get(
+                "per_document_chunk_limit", DEFAULT_PER_DOC_CHUNK_LIMIT
+            ),
+        }
+
+        retention_config = maintenance_config.get("retention", {})
+        self.hot_window_days = max(
+            0, retention_config.get("hot_days", DEFAULT_HOT_RETENTION_DAYS)
+        )
+        self.min_hot_updates = max(
+            0, retention_config.get("min_hot_updates", DEFAULT_MIN_HOT_UPDATES)
+        )
+
+        paths_config = maintenance_config.get("paths", {})
+        archive_subdir = paths_config.get("archive_dir", DEFAULT_ARCHIVE_SUBDIR)
+        digest_subdir = paths_config.get("digest_dir", DEFAULT_DIGEST_SUBDIR)
+        self.archive_dir = (self.docs_dir / Path(archive_subdir)).resolve()
+        if not validate_path(self.archive_dir, self.docs_dir):
+            self.archive_dir = (self.docs_dir / DEFAULT_ARCHIVE_SUBDIR).resolve()
+
+        self.digest_dir = (self.docs_dir / Path(digest_subdir)).resolve()
+        if not validate_path(self.digest_dir, self.docs_dir):
+            self.digest_dir = (self.docs_dir / DEFAULT_DIGEST_SUBDIR).resolve()
+
+        auto_config = maintenance_config.get("auto_compact", {})
+        self.rebuild_after_compact = bool(
+            auto_config.get("rebuild_after_compact", True)
+        )
+
+        self._compacting = False
 
     @property
     def embedding_model(self):
@@ -1777,11 +2103,24 @@ class UniversalRAG:
             self._embedding_model = SentenceTransformer(self.model_name)
         return self._embedding_model
 
-    def build(self, force_rebuild: bool = False) -> None:
-        """Build or update the vector database."""
+    def build(self, force_rebuild: bool = False, auto_approve: bool = False) -> None:
+        """Build or update the vector database with manifest-driven deduplication."""
         start_time = time.time()
 
-        # Find documents
+        manifest_path = self.db_dir / MANIFEST_FILENAME
+        manifest = load_manifest(manifest_path, quiet=self.quiet)
+        existing_docs: Dict[str, Any] = manifest.get("documents", {})
+        previous_model = manifest.get("model_name")
+        model_changed = previous_model and previous_model != self.model_name
+
+        if model_changed and not force_rebuild and not self.quiet:
+            print(
+                "Embedding model changed from "
+                f"{previous_model} → {self.model_name}; performing full rebuild."
+            )
+
+        effective_rebuild = force_rebuild or bool(model_changed)
+
         files = self.document_processor.find_documents()
         if not files:
             log_error("No documents found in docs/ directory", quiet=self.quiet)
@@ -1794,48 +2133,133 @@ class UniversalRAG:
         if not self.quiet:
             print(f"Found {len(files)} documents")
 
-        # Process each document
-        all_documents = []
-        for i, file_path in enumerate(files, 1):
-            if not self.quiet:
-                print(f"[{i}/{len(files)}] Processing {file_path.name}...")
-            docs = self.document_processor.process_document(file_path)
-            all_documents.extend(docs)
+        file_infos: List[Tuple[Path, str, Optional[str]]] = []
+        sources_on_disk: Set[str] = set()
+        for file_path in files:
+            source = str(file_path.relative_to(self.docs_dir))
+            file_hash = self.document_processor.get_file_hash(file_path)
+            if file_hash is None:
+                continue
+            file_infos.append((file_path, source, file_hash))
+            sources_on_disk.add(source)
 
-        if not all_documents:
-            log_error("No content could be extracted from documents", quiet=self.quiet)
-            if not self.quiet:
-                print("This could mean:")
-                print("- PDF files are corrupted or password-protected")
-                print("- Word documents (.docx) are corrupted")
-                print("- Text files are empty or have encoding issues")
-                print("- Markdown files are empty")
-                print("- Files are not readable")
-                print("Check your files and try again.")
+        if not file_infos:
+            log_error("No readable documents available for indexing", quiet=self.quiet)
             return
 
-        if not self.quiet:
-            print(f"Generated {len(all_documents)} text chunks")
-            print("Generating embeddings...")
+        ids_to_delete: List[str] = []
+        removed_sources = sorted(set(existing_docs.keys()) - sources_on_disk)
+        for removed_source in removed_sources:
+            ids_to_delete.extend(existing_docs.get(removed_source, {}).get("chunk_ids", []))
 
-        # Generate embeddings
-        texts = [doc["text"] for doc in all_documents]
-        embeddings = self.embedding_model.encode(
-            texts, show_progress_bar=not self.quiet
-        )
+        all_documents: List[Dict[str, Any]] = []
+        manifest_updates: Dict[str, Any] = {}
+        unchanged_docs: Dict[str, Any] = {}
 
-        # Build index
-        self.database_manager.build_index(
-            all_documents, embeddings, force_rebuild=force_rebuild
+        if effective_rebuild and existing_docs and not force_rebuild:
+            # If model drift triggered the rebuild we still want a clean slate in the DB
+            force_rebuild = True
+
+        for index, (file_path, source, file_hash) in enumerate(file_infos, 1):
+            if not self.quiet:
+                status = "rebuilding" if effective_rebuild else "checking"
+                print(f"[{index}/{len(file_infos)}] {status} {source}")
+
+            manifest_entry = existing_docs.get(source)
+            if not effective_rebuild and manifest_entry and manifest_entry.get("file_hash") == file_hash:
+                unchanged_docs[source] = manifest_entry
+                continue
+
+            if manifest_entry:
+                ids_to_delete.extend(manifest_entry.get("chunk_ids", []))
+
+            docs = self.document_processor.process_document(file_path, file_hash=file_hash)
+            if not docs:
+                continue
+
+            all_documents.extend(docs)
+            manifest_updates[source] = {
+                "file_hash": file_hash,
+                "chunk_ids": [doc["id"] for doc in docs],
+                "chunk_count": len(docs),
+                "last_indexed": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "source": source,
+            }
+
+        if not all_documents and not ids_to_delete and not removed_sources:
+            if not self.quiet:
+                print("No changes detected; index is already up-to-date.")
+            # Ensure manifest still records the current model for future checks
+            manifest["model_name"] = self.model_name
+            save_manifest(manifest_path, manifest)
+            return
+
+        if not effective_rebuild:
+            # Remove stale chunks before inserting replacements
+            unique_ids = sorted(set(ids_to_delete))
+            self.database_manager.delete_by_ids(unique_ids)
+            self.database_manager.delete_by_sources(removed_sources)
+
+        if not all_documents and effective_rebuild:
+            log_error("No content could be extracted from documents", quiet=self.quiet)
+            return
+
+        embeddings = None
+        embedding_dim = manifest.get("embedding_dim")
+        chunk_total = 0
+        if all_documents:
+            if not self.quiet:
+                print(f"Generating embeddings for {len(all_documents)} chunks...")
+            texts = [doc["text"] for doc in all_documents]
+            embeddings = self.embedding_model.encode(
+                texts, show_progress_bar=not self.quiet
+            )
+            embedding_dim = len(embeddings[0]) if len(all_documents) else embedding_dim
+            chunk_total = len(all_documents)
+
+            self.database_manager.build_index(
+                all_documents,
+                embeddings,
+                force_rebuild=effective_rebuild,
+            )
+
+        # Update manifest state combining unchanged + newly processed docs
+        updated_manifest_docs = {
+            **{src: data for src, data in unchanged_docs.items() if src not in removed_sources},
+            **manifest_updates,
+        }
+        manifest.update(
+            {
+                "documents": updated_manifest_docs,
+                "model_name": self.model_name,
+                "embedding_dim": embedding_dim,
+                "last_built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
         )
+        save_manifest(manifest_path, manifest)
 
         elapsed = time.time() - start_time
+        processed_files = len(manifest_updates)
+        unchanged_files = len(unchanged_docs)
+        removed_count = len(removed_sources)
+        manifest_chunk_total = sum(
+            entry.get("chunk_count", 0) for entry in updated_manifest_docs.values()
+        )
+
         print(
-            f"{SYMBOLS['success']} Successfully indexed {len(all_documents)} chunks from {len(files)} files"
+            f"{SYMBOLS['success']} Indexed {chunk_total} chunks | "
+            f"updated {processed_files} files, unchanged {unchanged_files}, removed {removed_count}"
         )
         print(f"Database saved to: {self.db_dir}")
         if not self.quiet:
             print(f"Build completed in {elapsed:.1f} seconds")
+
+        if not self._compacting:
+            self._handle_post_build_maintenance(
+                manifest_docs=updated_manifest_docs,
+                manifest_chunk_total=manifest_chunk_total,
+                auto_approve=auto_approve,
+            )
     
     def search(
         self,
@@ -1844,15 +2268,25 @@ class UniversalRAG:
         hybrid: bool = False,
         expand_query: bool = False,
         show_scores: bool = None,
+        path_filter: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Search the vector database with enhanced capabilities."""
+        if path_filter:
+            # Normalize path: remove leading ./ and docs/ prefix if present
+            path_filter = path_filter.replace("\\", "/")
+            if path_filter.startswith("./"):
+                path_filter = path_filter[2:]
+            if path_filter.startswith("docs/"):
+                path_filter = path_filter[5:]
+
         return self.search_engine.search(
             query, 
             self.embedding_model,
             n_results, 
             hybrid, 
             expand_query, 
-            show_scores
+            show_scores,
+            path_filter
         )
     
     def interactive_search(self) -> None:
@@ -1898,7 +2332,525 @@ class UniversalRAG:
     
     def get_stats(self) -> Dict[str, Any]:
         """Get database statistics."""
-        return self.database_manager.get_stats()
+        stats = self.database_manager.get_stats()
+        if "error" in stats:
+            return stats
+
+        manifest_path = self.db_dir / MANIFEST_FILENAME
+        manifest = load_manifest(manifest_path, quiet=self.quiet)
+        manifest_docs: Dict[str, Any] = manifest.get("documents", {})
+
+        docs_on_disk = []
+        try:
+            docs_on_disk = [
+                str(path.relative_to(self.docs_dir))
+                for path in self.document_processor.find_documents()
+            ]
+        except Exception as error:  # pragma: no cover - defensive guard
+            log_warning("Unable to enumerate docs directory for status", error, quiet=self.quiet)
+
+        disk_sources = set(docs_on_disk)
+        indexed_sources = set(stats.get("sources", {}).keys())
+        manifest_sources = set(manifest_docs.keys())
+
+        missing_from_manifest = sorted(disk_sources - manifest_sources)
+        removed_from_disk = sorted(manifest_sources - disk_sources)
+
+        chunk_mismatches = []
+        for source in manifest_sources & indexed_sources:
+            manifest_count = manifest_docs.get(source, {}).get("chunk_count")
+            indexed_count = stats["sources"].get(source)
+            if manifest_count is not None and indexed_count is not None and manifest_count != indexed_count:
+                chunk_mismatches.append(
+                    {
+                        "source": source,
+                        "manifest": manifest_count,
+                        "indexed": indexed_count,
+                    }
+                )
+
+        stats.update(
+            {
+                "docs_on_disk": sorted(docs_on_disk),
+                "manifest_doc_total": len(manifest_docs),
+                "missing_from_manifest": missing_from_manifest,
+                "removed_in_manifest": removed_from_disk,
+                "chunk_mismatches": chunk_mismatches,
+                "embedding_model": manifest.get("model_name") or self.model_name,
+                "embedding_dim": manifest.get("embedding_dim"),
+                "last_built_at": manifest.get("last_built_at"),
+            }
+        )
+
+        manifest_chunk_total = sum(
+            entry.get("chunk_count", 0) for entry in manifest_docs.values()
+        )
+        maintenance = self._evaluate_thresholds(
+            manifest_docs=manifest_docs,
+            manifest_chunk_total=manifest_chunk_total,
+            db_chunk_total=stats.get("total_chunks"),
+        )
+
+        stats["manifest_chunk_total"] = manifest_chunk_total
+        stats["maintenance"] = maintenance
+        stats["thresholds"] = maintenance.get("thresholds", {})
+
+        return stats
+
+    def _evaluate_thresholds(
+        self,
+        *,
+        manifest_docs: Dict[str, Any],
+        manifest_chunk_total: int,
+        db_chunk_total: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate index size against configured maintenance thresholds."""
+        chunk_counts: Dict[str, int] = {
+            source: max(0, int(data.get("chunk_count", 0)))
+            for source, data in manifest_docs.items()
+        }
+        doc_total = len(chunk_counts)
+        chunk_total_reference = max(
+            manifest_chunk_total,
+            db_chunk_total if isinstance(db_chunk_total, int) else 0,
+        )
+
+        thresholds = self.thresholds
+        soft_chunk_limit = thresholds.get("soft_chunk_limit", DEFAULT_SOFT_CHUNK_LIMIT)
+        hard_chunk_limit = thresholds.get("hard_chunk_limit", DEFAULT_HARD_CHUNK_LIMIT)
+        soft_document_limit = thresholds.get("soft_document_limit", DEFAULT_SOFT_DOCUMENT_LIMIT)
+        per_document_limit = thresholds.get(
+            "per_document_chunk_limit", DEFAULT_PER_DOC_CHUNK_LIMIT
+        )
+
+        per_doc_exceeded: List[Tuple[str, int]] = []
+        if per_document_limit:
+            per_doc_exceeded = [
+                (source, count)
+                for source, count in chunk_counts.items()
+                if count > per_document_limit
+            ]
+
+        largest_source: Optional[str] = None
+        largest_count = 0
+        if chunk_counts:
+            largest_source, largest_count = max(
+                chunk_counts.items(), key=lambda item: item[1]
+            )
+
+        messages: List[str] = []
+        soft_trigger = False
+        hard_trigger = False
+
+        if soft_chunk_limit and chunk_total_reference > soft_chunk_limit:
+            soft_trigger = True
+            messages.append(
+                f"Chunk soft limit exceeded: {chunk_total_reference} chunks > {soft_chunk_limit}"
+            )
+
+        if soft_document_limit and doc_total > soft_document_limit:
+            soft_trigger = True
+            messages.append(
+                f"Document soft limit exceeded: {doc_total} docs > {soft_document_limit}"
+            )
+
+        if hard_chunk_limit and chunk_total_reference >= hard_chunk_limit:
+            hard_trigger = True
+            messages.append(
+                f"Hard chunk limit reached: {chunk_total_reference} chunks ≥ {hard_chunk_limit}"
+            )
+
+        if per_doc_exceeded:
+            soft_trigger = True
+            preview = ", ".join(
+                f"{source} ({count})" for source, count in per_doc_exceeded[:5]
+            )
+            messages.append(
+                f"Per-document limit exceeded ({per_document_limit} chunks) by: {preview}"
+            )
+            if len(per_doc_exceeded) > 5:
+                messages.append(
+                    f"(+{len(per_doc_exceeded) - 5} additional documents above limit)"
+                )
+
+        return {
+            "thresholds": thresholds,
+            "chunk_total": chunk_total_reference,
+            "manifest_chunk_total": manifest_chunk_total,
+            "document_total": doc_total,
+            "largest_document": {
+                "source": largest_source,
+                "chunks": largest_count,
+            },
+            "per_document_exceeded": per_doc_exceeded,
+            "soft_limit_exceeded": soft_trigger,
+            "hard_limit_exceeded": hard_trigger,
+            "messages": messages,
+            "needs_attention": soft_trigger or hard_trigger,
+        }
+
+    def _handle_post_build_maintenance(
+        self,
+        *,
+        manifest_docs: Dict[str, Any],
+        manifest_chunk_total: int,
+        auto_approve: bool,
+    ) -> None:
+        """Check thresholds after build and offer automated compaction."""
+        try:
+            db_stats = self.database_manager.get_stats()
+            db_chunk_total = (
+                db_stats.get("total_chunks")
+                if isinstance(db_stats, dict)
+                else None
+            )
+        except Exception:
+            db_chunk_total = None
+
+        state = self._evaluate_thresholds(
+            manifest_docs=manifest_docs,
+            manifest_chunk_total=manifest_chunk_total,
+            db_chunk_total=db_chunk_total,
+        )
+
+        if not state.get("needs_attention"):
+            return
+
+        if not self.quiet:
+            print("\nMaintenance thresholds:")
+            print(
+                f"  Chunks: {state['chunk_total']} (manifest {state['manifest_chunk_total']})"
+            )
+            print(f"  Documents: {state['document_total']}")
+            largest = state.get("largest_document", {})
+            if largest.get("source"):
+                print(
+                    f"  Largest source: {largest['source']} ({largest['chunks']} chunks)"
+                )
+            for message in state.get("messages", []):
+                print(f"  - {message}")
+
+        interactive = sys.stdin.isatty() and not self.quiet
+
+        if state.get("hard_limit_exceeded"):
+            if auto_approve or interactive:
+                if not auto_approve and interactive:
+                    answer = input(
+                        "Hard limit reached. Run compaction now? [y/N]: "
+                    ).strip().lower()
+                    if answer not in ("y", "yes"):
+                        log_error(
+                            "Compaction declined while hard limit is active; build cannot continue.",
+                            quiet=self.quiet,
+                        )
+                        raise RuntimeError("Compaction required but declined")
+                summary = self.compact(auto_confirm=True, quiet=self.quiet, reason="hard_limit")
+                if not self.quiet:
+                    if summary.get("changed"):
+                        print(
+                            f"{SYMBOLS['success']} Compacted {summary['archived_updates']} updates."
+                        )
+                    else:
+                        print("No compaction changes were required.")
+            else:
+                log_error(
+                    "Hard limit exceeded and no approval available. Rerun with --yes or execute 'python raggy.py compact'.",
+                    quiet=self.quiet,
+                )
+                raise RuntimeError("Compaction required but not approved")
+            return
+
+        if state.get("soft_limit_exceeded"):
+            if auto_approve:
+                summary = self.compact(auto_confirm=True, quiet=self.quiet, reason="soft_limit")
+                if not self.quiet and summary.get("changed"):
+                    print(
+                        f"{SYMBOLS['success']} Compacted {summary['archived_updates']} updates."
+                    )
+                return
+
+            if interactive:
+                answer = input(
+                    "Maintenance thresholds exceeded. Run compaction now? [y/N]: "
+                ).strip().lower()
+                if answer in ("y", "yes"):
+                    summary = self.compact(
+                        auto_confirm=True,
+                        quiet=self.quiet,
+                        reason="soft_limit",
+                    )
+                    if not self.quiet and summary.get("changed"):
+                        print(
+                            f"{SYMBOLS['success']} Compacted {summary['archived_updates']} updates."
+                        )
+                else:
+                    if not self.quiet:
+                        print(
+                            "Skipping compaction for now. Run 'python raggy.py compact' when ready."
+                        )
+            else:
+                if not self.quiet:
+                    print(
+                        "Maintenance thresholds exceeded in non-interactive mode. Run 'python raggy.py compact --yes' to resolve."
+                    )
+
+    def compact(
+        self,
+        *,
+        auto_confirm: bool = False,
+        quiet: Optional[bool] = None,
+        reason: str = "manual",
+    ) -> Dict[str, Any]:
+        """Run the automated compaction workflow."""
+        quiet = self.quiet if quiet is None else quiet
+        summary = self._compact_development_state(auto_confirm=auto_confirm, quiet=quiet)
+
+        if summary.get("changed") and self.rebuild_after_compact:
+            if not quiet:
+                print("Rebuilding index after compaction...")
+            self._compacting = True
+            try:
+                self.build(force_rebuild=False, auto_approve=True)
+            finally:
+                self._compacting = False
+            summary["rebuild_triggered"] = True
+
+        summary["reason"] = reason
+        return summary
+
+    def _compact_development_state(
+        self, *, auto_confirm: bool, quiet: bool
+    ) -> Dict[str, Any]:
+        """Archive aged updates from DEVELOPMENT_STATE.md into monthly files and digests."""
+        summary: Dict[str, Any] = {
+            "changed": False,
+            "archived_updates": 0,
+            "kept_updates": 0,
+            "archive_targets": {},
+            "digest_updates": {},
+        }
+
+        dev_state_path = self.docs_dir / "DEVELOPMENT_STATE.md"
+        if not dev_state_path.exists():
+            log_error("DEVELOPMENT_STATE.md not found; nothing to compact.", quiet=quiet)
+            return summary
+
+        try:
+            content = dev_state_path.read_text(encoding="utf-8")
+        except Exception as error:
+            handle_file_error(dev_state_path, "read", error, quiet=quiet)
+            return summary
+
+        update_pattern = re.compile(
+            r"^##\s+Update\s+-\s+(\d{4}-\d{2}-\d{2})(?:\s*\(([^\n)]*)\))?\s*\n",
+            re.MULTILINE,
+        )
+        matches = list(update_pattern.finditer(content))
+        if not matches:
+            if not quiet:
+                print("No update sections detected in DEVELOPMENT_STATE.md; skipping compaction.")
+            return summary
+
+        updates: List[Dict[str, Any]] = []
+        for idx, match in enumerate(matches):
+            start = match.start()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(content)
+            block = content[start:end]
+            date_str = match.group(1)
+            title = (match.group(2) or "").strip()
+            parsed_date = None
+            try:
+                parsed_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                parsed_date = None
+
+            updates.append(
+                {
+                    "id": idx,
+                    "start": start,
+                    "end": end,
+                    "block": block,
+                    "date": parsed_date,
+                    "date_str": date_str,
+                    "title": title,
+                }
+            )
+
+        if not updates:
+            return summary
+
+        cutoff_date = datetime.now().date() - timedelta(days=self.hot_window_days)
+
+        # Ensure a minimum number of updates stay hot even if older than cutoff
+        hot_keep_ids: Set[int] = set()
+        dated_updates = [update for update in updates if update["date"] is not None]
+        if dated_updates and self.min_hot_updates > 0:
+            dated_sorted = sorted(dated_updates, key=lambda item: item["date"], reverse=True)
+            for candidate in dated_sorted[: self.min_hot_updates]:
+                hot_keep_ids.add(candidate["id"])
+
+        archive_candidates: List[Dict[str, Any]] = []
+        keep_candidates: List[Dict[str, Any]] = []
+
+        for update in updates:
+            parsed_date = update["date"]
+            if parsed_date is None:
+                keep_candidates.append(update)
+                continue
+
+            if update["id"] in hot_keep_ids:
+                keep_candidates.append(update)
+                continue
+
+            age_days = (datetime.now().date() - parsed_date).days
+            if self.hot_window_days >= 0 and age_days > self.hot_window_days:
+                archive_candidates.append(update)
+            else:
+                keep_candidates.append(update)
+
+        if not archive_candidates:
+            if not quiet:
+                print("All updates fall within the hot window; no compaction necessary.")
+            summary["kept_updates"] = len(updates)
+            return summary
+
+        if not auto_confirm:
+            if not sys.stdin.isatty() or quiet:
+                log_warning(
+                    "Compaction requires confirmation; rerun with --yes to proceed.",
+                    quiet=quiet,
+                )
+                summary["kept_updates"] = len(updates)
+                return summary
+
+            preview_titles = ", ".join(
+                (candidate["title"] or candidate["date_str"]) for candidate in archive_candidates[:3]
+            )
+            prompt = (
+                f"Archive {len(archive_candidates)} updates older than {self.hot_window_days} days"
+                f"? ({preview_titles}{'...' if len(archive_candidates) > 3 else ''}) [y/N]: "
+            )
+            answer = input(prompt).strip().lower()
+            if answer not in ("y", "yes"):
+                if not quiet:
+                    print("Compaction cancelled.")
+                summary["kept_updates"] = len(updates)
+                return summary
+
+        archive_ids = {candidate["id"] for candidate in archive_candidates}
+        slices: List[str] = []
+        cursor = 0
+        for update in updates:
+            if update["id"] in archive_ids:
+                slices.append(content[cursor : update["start"]])
+                cursor = update["end"]
+        slices.append(content[cursor:])
+        updated_content = "".join(slices)
+        updated_content = updated_content.rstrip() + "\n"
+
+        archive_counts: Dict[str, int] = defaultdict(int)
+        digest_counts: Dict[str, int] = defaultdict(int)
+
+        for candidate in archive_candidates:
+            archive_date = candidate.get("date")
+            if archive_date is None:
+                archive_file = self.archive_dir / "undated.md"
+                archive_header = "# Development State Archive — Undated\n\n"
+                summary_label = "undated"
+            else:
+                archive_file = self.archive_dir / f"{archive_date.year}-{archive_date.month:02d}.md"
+                month_label = archive_date.strftime("%B %Y")
+                archive_header = f"# Development State Archive — {month_label}\n\n"
+                summary_label = f"{archive_date.year}-{archive_date.month:02d}"
+
+            if not validate_path(archive_file, self.docs_dir):
+                log_error(
+                    f"Archive path {archive_file} is outside docs/. Skipping this entry.",
+                    quiet=quiet,
+                )
+                continue
+
+            archive_file.parent.mkdir(parents=True, exist_ok=True)
+            existing_archive = ""
+            if archive_file.exists():
+                try:
+                    existing_archive = archive_file.read_text(encoding="utf-8")
+                except Exception:
+                    existing_archive = ""
+            else:
+                try:
+                    archive_file.write_text(archive_header, encoding="utf-8")
+                except Exception as error:
+                    handle_file_error(archive_file, "write", error, quiet=quiet)
+                    continue
+
+            block = candidate["block"].strip()
+            if block not in existing_archive:
+                try:
+                    with archive_file.open("a", encoding="utf-8") as handle:
+                        if not existing_archive:
+                            # Header already written
+                            pass
+                        handle.write("\n" + block + "\n\n")
+                except Exception as error:
+                    handle_file_error(archive_file, "append", error, quiet=quiet)
+                    continue
+
+            archive_counts[str(archive_file.relative_to(self.docs_dir))] += 1
+
+            if archive_date is not None:
+                digest_file = self.digest_dir / f"{archive_date.year}-{archive_date.month:02d}.md"
+                if validate_path(digest_file, self.docs_dir):
+                    digest_file.parent.mkdir(parents=True, exist_ok=True)
+                    digest_header = (
+                        f"# Monthly Digest — {archive_date.strftime('%B %Y')}\n\n"
+                    )
+                    try:
+                        if not digest_file.exists():
+                            digest_file.write_text(digest_header, encoding="utf-8")
+                    except Exception as error:
+                        handle_file_error(digest_file, "write", error, quiet=quiet)
+                        continue
+
+                    summary_line = (
+                        f"- {candidate['date_str']}: {candidate['title'] or 'Update'} → "
+                        f"{archive_file.relative_to(self.docs_dir)}"
+                    )
+                    try:
+                        existing_digest = digest_file.read_text(encoding="utf-8")
+                    except Exception:
+                        existing_digest = ""
+                    if summary_line not in existing_digest:
+                        try:
+                            with digest_file.open("a", encoding="utf-8") as handle:
+                                handle.write(summary_line + "\n")
+                        except Exception as error:
+                            handle_file_error(digest_file, "append", error, quiet=quiet)
+                            continue
+                    digest_counts[str(digest_file.relative_to(self.docs_dir))] += 1
+
+        try:
+            dev_state_path.write_text(updated_content, encoding="utf-8")
+        except Exception as error:
+            handle_file_error(dev_state_path, "write", error, quiet=quiet)
+            return summary
+
+        summary.update(
+            {
+                "changed": True,
+                "archived_updates": len(archive_candidates),
+                "kept_updates": len(keep_candidates),
+                "archive_targets": archive_counts,
+                "digest_updates": digest_counts,
+            }
+        )
+
+        if not quiet:
+            print(
+                f"Archived {len(archive_candidates)} updates into {len(archive_counts)} archive files."
+            )
+
+        return summary
 
 
     def _get_file_hash(self, file_path: Path) -> str:
@@ -2108,6 +3060,9 @@ class UniversalRAG:
         if header and self.config["chunking"]["preserve_headers"]:
             content = f"{header}\n\n{content}"
 
+        # Ensure overlap never eliminates forward progress
+        effective_overlap = min(overlap, max(target_size - 1, 0))
+
         # Split content into chunks
         if len(content) <= target_size:
             chunks.append(
@@ -2122,24 +3077,31 @@ class UniversalRAG:
             )
         else:
             start = 0
+            last_start = -1
             chunk_index = 0
 
             while start < len(content):
                 end = start + target_size
 
-                # Try to break at paragraph or sentence boundary
+                # Try to break at paragraph or sentence boundary within a bounded window
                 if end < len(content):
                     # Look for paragraph breaks first
+                    found_boundary = False
                     for i in range(end, max(start + target_size - 300, start), -1):
-                        if i > start and content[i - 2 : i] == "\n\n":
+                        if i - 2 >= start and content[i - 2 : i] == "\n\n":
                             end = i
+                            found_boundary = True
                             break
-                    else:
+                    if not found_boundary:
                         # Fall back to sentence breaks
                         for i in range(end, max(start + target_size - 200, start), -1):
-                            if content[i] in ".!?\n":
+                            if i < len(content) and content[i] in ".!?\n":
                                 end = i + 1
                                 break
+
+                # Prevent degenerate range and guarantee progress
+                if end <= start:
+                    end = min(start + max(1, target_size // 2), len(content))
 
                 chunk_text = content[start:end].strip()
                 if chunk_text:
@@ -2156,7 +3118,12 @@ class UniversalRAG:
                     )
                     chunk_index += 1
 
-                start = end - overlap
+                # Compute next start ensuring strict forward progress
+                next_start = end - effective_overlap
+                if next_start <= start:
+                    next_start = start + 1
+                last_start = start
+                start = next_start
 
         return chunks
 
@@ -2480,6 +3447,7 @@ Examples:
     %(prog)s build                              # Build/update index with smart chunking
     %(prog)s search "your search term"         # Semantic search with normalized scores
     %(prog)s status                             # Database statistics and configuration
+    %(prog)s compact                            # Archive aged docs and refresh the index
     
   Enhanced Search:
     %(prog)s search "exact phrase" --hybrid    # Hybrid semantic + keyword search
@@ -2503,7 +3471,19 @@ Examples:
 
     parser.add_argument(
         "command",
-        choices=["init", "build", "rebuild", "search", "interactive", "status", "optimize", "test", "diagnose", "validate"],
+        choices=[
+            "init",
+            "build",
+            "rebuild",
+            "search",
+            "interactive",
+            "status",
+            "compact",
+            "optimize",
+            "test",
+            "diagnose",
+            "validate",
+        ],
         help="Command to execute",
     )
     parser.add_argument("query", nargs="*", help="Search query (for search command)")
@@ -2546,6 +3526,9 @@ Examples:
         "--expand", action="store_true", help="Expand query with synonyms"
     )
     parser.add_argument(
+        "--path", help="Filter results by file path/directory (e.g., 'docs/CHANGELOG.md')"
+    )
+    parser.add_argument(
         "--model-preset",
         choices=["fast", "balanced", "multilingual", "accurate"],
         help="Use model preset (overrides --model)",
@@ -2561,6 +3544,12 @@ Examples:
     )
     parser.add_argument(
         "--config", help="Path to config file (default: raggy_config.yaml)"
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Automatically approve maintenance prompts (use with caution)",
     )
     parser.add_argument("--version", action="version", version=f"raggy {__version__}")
 
@@ -2592,7 +3581,10 @@ class BuildCommand(Command):
         force_rebuild = hasattr(args, 'force_rebuild') and args.force_rebuild
         if hasattr(args, 'command') and args.command == 'rebuild':
             force_rebuild = True
-        rag.build(force_rebuild=force_rebuild)
+        rag.build(
+            force_rebuild=force_rebuild,
+            auto_approve=getattr(args, "yes", False),
+        )
 
 
 class SearchCommand(Command):
@@ -2605,7 +3597,11 @@ class SearchCommand(Command):
 
         query = " ".join(args.query)
         results = rag.search(
-            query, n_results=args.results, hybrid=args.hybrid, expand_query=args.expand
+            query, 
+            n_results=args.results, 
+            hybrid=args.hybrid, 
+            expand_query=args.expand,
+            path_filter=args.path
         )
 
         if not results:
@@ -2623,7 +3619,9 @@ class SearchCommand(Command):
                             "final_score": r.get("final_score", r.get("similarity", 0)),
                             "semantic_score": r.get("semantic_score", 0),
                             "keyword_score": r.get("keyword_score", 0),
+                            "keyword_score": r.get("keyword_score", 0),
                             "interpretation": r.get("score_interpretation", "Unknown"),
+                            "is_current_state": r["metadata"].get("is_current_state", False),
                         }
                         for r in results
                     ],
@@ -2672,11 +3670,84 @@ class StatusCommand(Command):
             print(f"Database Statistics:")
             print(f"  Total chunks: {stats['total_chunks']}")
             print(f"  Database path: {stats['db_path']}")
-            print(f"  Model: {rag.model_name}")
+            model_label = stats.get("embedding_model", rag.model_name)
+            if model_label != rag.model_name:
+                print(f"  Model: {model_label} (configured: {rag.model_name})")
+            else:
+                print(f"  Model: {model_label}")
+            if stats.get("embedding_dim"):
+                print(f"  Embedding dim: {stats['embedding_dim']}")
+            if stats.get("last_built_at"):
+                print(f"  Last build: {stats['last_built_at']}")
+            print(f"  Documents on disk: {len(stats.get('docs_on_disk', []))}")
+            print(f"  Manifest entries: {stats.get('manifest_doc_total', 0)}")
+            print(f"  Indexed documents: {len(stats.get('sources', {}))}")
             print(f"  Config: {'Custom' if args.config else 'Default'}")
+            if stats.get("missing_from_manifest"):
+                print("  Missing from manifest (needs build):")
+                for source in stats["missing_from_manifest"]:
+                    print(f"    - {source}")
+            if stats.get("removed_in_manifest"):
+                print("  Orphaned manifest entries (removed on disk):")
+                for source in stats["removed_in_manifest"]:
+                    print(f"    - {source}")
+            if stats.get("chunk_mismatches"):
+                print("  Chunk mismatches:")
+                for mismatch in stats["chunk_mismatches"]:
+                    print(
+                        "    - {source}: manifest={manifest} indexed={indexed}".format(
+                            **mismatch
+                        )
+                    )
             print(f"  Documents:")
             for source, count in sorted(stats["sources"].items()):
                 print(f"    {source}: {count} chunks")
+
+            maintenance = stats.get("maintenance", {})
+            if maintenance:
+                thresholds = maintenance.get("thresholds", {})
+                print("  Thresholds:")
+                print(
+                    f"    Soft chunks: {thresholds.get('soft_chunk_limit', 'n/a')}"
+                )
+                print(
+                    f"    Hard chunks: {thresholds.get('hard_chunk_limit', 'n/a')}"
+                )
+                print(
+                    f"    Soft docs: {thresholds.get('soft_document_limit', 'n/a')}"
+                )
+                print(
+                    f"    Per-doc limit: {thresholds.get('per_document_chunk_limit', 'n/a')}"
+                )
+
+                if maintenance.get("messages"):
+                    print("  Maintenance warnings:")
+                    for message in maintenance["messages"]:
+                        print(f"    - {message}")
+                else:
+                    print("  Maintenance warnings: none")
+
+
+class CompactCommand(Command):
+    """Archive aged documentation and rebuild the index."""
+
+    def execute(self, args: Any, rag: UniversalRAG) -> None:
+        summary = rag.compact(
+            auto_confirm=getattr(args, "yes", False),
+            quiet=args.quiet,
+            reason="manual",
+        )
+
+        if summary.get("changed"):
+            archived = summary.get("archived_updates", 0)
+            targets = ", ".join(summary.get("archive_targets", {}).keys())
+            if not args.quiet:
+                print(
+                    f"{SYMBOLS['success']} Archived {archived} updates. Files: {targets or 'n/a'}"
+                )
+        else:
+            if not args.quiet:
+                print("No compaction changes required.")
 
 
 class OptimizeCommand(Command):
@@ -2802,6 +3873,7 @@ class CommandFactory:
         "search": SearchCommand,
         "interactive": InteractiveCommand,
         "status": StatusCommand,
+        "compact": CompactCommand,
         "optimize": OptimizeCommand,
         "test": TestCommand,
         "diagnose": DiagnoseCommand,
