@@ -567,6 +567,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             "paths": {
                 "archive_dir": DEFAULT_ARCHIVE_SUBDIR,
                 "digest_dir": DEFAULT_DIGEST_SUBDIR,
+                "compaction_source": "CHANGELOG.md",  # File to compact (legacy: DEVELOPMENT_STATE.md)
             },
             "auto_compact": {
                 "rebuild_after_compact": True,
@@ -2621,7 +2622,7 @@ class UniversalRAG:
     def _compact_development_state(
         self, *, auto_confirm: bool, quiet: bool
     ) -> Dict[str, Any]:
-        """Archive aged updates from DEVELOPMENT_STATE.md into monthly files and digests."""
+        """Archive aged updates from the configured compaction source file into monthly files and digests."""
         summary: Dict[str, Any] = {
             "changed": False,
             "archived_updates": 0,
@@ -2630,15 +2631,17 @@ class UniversalRAG:
             "digest_updates": {},
         }
 
-        dev_state_path = self.docs_dir / "DEVELOPMENT_STATE.md"
-        if not dev_state_path.exists():
-            log_error("DEVELOPMENT_STATE.md not found; nothing to compact.", quiet=quiet)
+        # Get compaction source from config (default: CHANGELOG.md, legacy: DEVELOPMENT_STATE.md)
+        compaction_source = self.config.get("maintenance", {}).get("paths", {}).get("compaction_source", "CHANGELOG.md")
+        source_path = self.docs_dir / compaction_source
+        if not source_path.exists():
+            log_error(f"{compaction_source} not found; nothing to compact.", quiet=quiet)
             return summary
 
         try:
-            content = dev_state_path.read_text(encoding="utf-8")
+            content = source_path.read_text(encoding="utf-8")
         except Exception as error:
-            handle_file_error(dev_state_path, "read", error, quiet=quiet)
+            handle_file_error(source_path, "read", error, quiet=quiet)
             return summary
 
         update_pattern = re.compile(
@@ -2648,7 +2651,7 @@ class UniversalRAG:
         matches = list(update_pattern.finditer(content))
         if not matches:
             if not quiet:
-                print("No update sections detected in DEVELOPMENT_STATE.md; skipping compaction.")
+                print(f"No update sections detected in {compaction_source}; skipping compaction.")
             return summary
 
         updates: List[Dict[str, Any]] = []
@@ -2830,9 +2833,9 @@ class UniversalRAG:
                     digest_counts[str(digest_file.relative_to(self.docs_dir))] += 1
 
         try:
-            dev_state_path.write_text(updated_content, encoding="utf-8")
+            source_path.write_text(updated_content, encoding="utf-8")
         except Exception as error:
-            handle_file_error(dev_state_path, "write", error, quiet=quiet)
+            handle_file_error(source_path, "write", error, quiet=quiet)
             return summary
 
         summary.update(
@@ -3665,67 +3668,71 @@ class StatusCommand(Command):
     def execute(self, args: Any, rag: UniversalRAG) -> None:
         stats = rag.get_stats()
         if "error" in stats:
-            print(f"Error getting stats: {stats['error']}")
+            # On a fresh setup (including `./raggy init`), the database will not
+            # exist yet. Treat this as an informative state, not a hard error.
+            print("No database found yet.")
+            print("Run './raggy build' to index your documents before requesting status.")
+            return
+
+        print(f"Database Statistics:")
+        print(f"  Total chunks: {stats['total_chunks']}")
+        print(f"  Database path: {stats['db_path']}")
+        model_label = stats.get("embedding_model", rag.model_name)
+        if model_label != rag.model_name:
+            print(f"  Model: {model_label} (configured: {rag.model_name})")
         else:
-            print(f"Database Statistics:")
-            print(f"  Total chunks: {stats['total_chunks']}")
-            print(f"  Database path: {stats['db_path']}")
-            model_label = stats.get("embedding_model", rag.model_name)
-            if model_label != rag.model_name:
-                print(f"  Model: {model_label} (configured: {rag.model_name})")
-            else:
-                print(f"  Model: {model_label}")
-            if stats.get("embedding_dim"):
-                print(f"  Embedding dim: {stats['embedding_dim']}")
-            if stats.get("last_built_at"):
-                print(f"  Last build: {stats['last_built_at']}")
-            print(f"  Documents on disk: {len(stats.get('docs_on_disk', []))}")
-            print(f"  Manifest entries: {stats.get('manifest_doc_total', 0)}")
-            print(f"  Indexed documents: {len(stats.get('sources', {}))}")
-            print(f"  Config: {'Custom' if args.config else 'Default'}")
-            if stats.get("missing_from_manifest"):
-                print("  Missing from manifest (needs build):")
-                for source in stats["missing_from_manifest"]:
-                    print(f"    - {source}")
-            if stats.get("removed_in_manifest"):
-                print("  Orphaned manifest entries (removed on disk):")
-                for source in stats["removed_in_manifest"]:
-                    print(f"    - {source}")
-            if stats.get("chunk_mismatches"):
-                print("  Chunk mismatches:")
-                for mismatch in stats["chunk_mismatches"]:
-                    print(
-                        "    - {source}: manifest={manifest} indexed={indexed}".format(
-                            **mismatch
-                        )
+            print(f"  Model: {model_label}")
+        if stats.get("embedding_dim"):
+            print(f"  Embedding dim: {stats['embedding_dim']}")
+        if stats.get("last_built_at"):
+            print(f"  Last build: {stats['last_built_at']}")
+        print(f"  Documents on disk: {len(stats.get('docs_on_disk', []))}")
+        print(f"  Manifest entries: {stats.get('manifest_doc_total', 0)}")
+        print(f"  Indexed documents: {len(stats.get('sources', {}))}")
+        print(f"  Config: {'Custom' if args.config else 'Default'}")
+        if stats.get("missing_from_manifest"):
+            print("  Missing from manifest (needs build):")
+            for source in stats["missing_from_manifest"]:
+                print(f"    - {source}")
+        if stats.get("removed_in_manifest"):
+            print("  Orphaned manifest entries (removed on disk):")
+            for source in stats["removed_in_manifest"]:
+                print(f"    - {source}")
+        if stats.get("chunk_mismatches"):
+            print("  Chunk mismatches:")
+            for mismatch in stats["chunk_mismatches"]:
+                print(
+                    "    - {source}: manifest={manifest} indexed={indexed}".format(
+                        **mismatch
                     )
-            print(f"  Documents:")
-            for source, count in sorted(stats["sources"].items()):
-                print(f"    {source}: {count} chunks")
+                )
+        print(f"  Documents:")
+        for source, count in sorted(stats["sources"].items()):
+            print(f"    {source}: {count} chunks")
 
-            maintenance = stats.get("maintenance", {})
-            if maintenance:
-                thresholds = maintenance.get("thresholds", {})
-                print("  Thresholds:")
-                print(
-                    f"    Soft chunks: {thresholds.get('soft_chunk_limit', 'n/a')}"
-                )
-                print(
-                    f"    Hard chunks: {thresholds.get('hard_chunk_limit', 'n/a')}"
-                )
-                print(
-                    f"    Soft docs: {thresholds.get('soft_document_limit', 'n/a')}"
-                )
-                print(
-                    f"    Per-doc limit: {thresholds.get('per_document_chunk_limit', 'n/a')}"
-                )
+        maintenance = stats.get("maintenance", {})
+        if maintenance:
+            thresholds = maintenance.get("thresholds", {})
+            print("  Thresholds:")
+            print(
+                f"    Soft chunks: {thresholds.get('soft_chunk_limit', 'n/a')}"
+            )
+            print(
+                f"    Hard chunks: {thresholds.get('hard_chunk_limit', 'n/a')}"
+            )
+            print(
+                f"    Soft docs: {thresholds.get('soft_document_limit', 'n/a')}"
+            )
+            print(
+                f"    Per-doc limit: {thresholds.get('per_document_chunk_limit', 'n/a')}"
+            )
 
-                if maintenance.get("messages"):
-                    print("  Maintenance warnings:")
-                    for message in maintenance["messages"]:
-                        print(f"    - {message}")
-                else:
-                    print("  Maintenance warnings: none")
+            if maintenance.get("messages"):
+                print("  Maintenance warnings:")
+                for message in maintenance["messages"]:
+                    print(f"    - {message}")
+            else:
+                print("  Maintenance warnings: none")
 
 
 class CompactCommand(Command):
